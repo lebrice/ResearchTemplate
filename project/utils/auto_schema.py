@@ -1,51 +1,142 @@
 import copy
 import dataclasses
 import inspect
+import itertools
 import json
-from collections.abc import Callable
 from logging import getLogger as get_logger
 from pathlib import Path
 from typing import Any, TypeGuard, TypeVar
 
 import hydra_zen
 import pydantic
+import pydantic.schema
+from omegaconf import DictConfig
+from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
+from pydantic_core import core_schema
 from simple_parsing.docstring import get_attribute_docstring, inspect_getdoc
 from simple_parsing.helpers.serialization.serializable import dump_yaml
 from simple_parsing.utils import Dataclass, PossiblyNestedDict, is_dataclass_type
 
+from project.configs.datamodule import REPO_ROOTDIR
+
 logger = get_logger(__name__)
+
+
+def add_or_update_shemas_for_yaml_configs(
+    configs_dir: Path = REPO_ROOTDIR / "project" / "configs",
+    schemas_dir: Path = REPO_ROOTDIR / "project" / "configs" / ".schemas",
+):
+    schemas_dir.mkdir(exist_ok=True)
+    (schemas_dir / ".gitkeep").touch()
+    for config_file in itertools.chain(configs_dir.rglob("*.yaml"), configs_dir.rglob("*.yml")):
+        if "_target_" not in config_file.read_text():
+            continue
+
+        schema_path = schemas_dir / f"{config_file.stem}_schema.json"
+        try:
+            add_schema_to_hydra_config_file(
+                input_file=config_file, output_file=config_file, schema_file=schema_path
+            )
+        except Exception as e:
+            logger.info(f"Unable to update the schema for yaml config file {config_file}: {e}")
+        else:
+            logger.info(f"Updated schema for {config_file}.")
 
 
 def add_schema_to_hydra_config_file(
     input_file: Path, output_file: Path, schema_file: Path
 ) -> bool:
     config = hydra_zen.load_from_yaml(input_file)
-    try:
-        target = hydra_zen.get_target(config)
-    except TypeError as err:
-        logger.debug(f"Error while trying to add a schema to file {input_file}: {err}")
-        return False
-
-    schema = get_schema(target)
+    assert isinstance(config, DictConfig)
+    schema = get_schema(config)
     schema_file.write_text(json.dumps(schema, indent=2) + "\n")
+    input_lines = input_file.read_text().splitlines(keepends=True)
+
+    # todo: remove this hard-coded assumption, use relative paths instead.
+    configs_dir = REPO_ROOTDIR / "project" / "configs"
+    assert input_file.is_relative_to(configs_dir)
+    assert output_file.is_relative_to(configs_dir)
+    assert schema_file.is_relative_to(configs_dir)
+    n_parents = len(input_file.relative_to(configs_dir).parts) - 1
+    relative_path_to_schema = Path(
+        "/".join(n_parents * [".."]) + "/" + str(schema_file.relative_to(configs_dir))
+    )
+    # relative_path_to_schema = schema_file.relative_to(REPO_ROOTDIR)
+
+    new_first_line = f"# yaml-language-server: $schema={relative_path_to_schema}\n"
+    # todo; remove leading empty lines.
+    if input_lines[0].startswith("# yaml-language-server: $schema="):
+        output_lines = [new_first_line, *input_lines[1:]]
+    else:
+        output_lines = [new_first_line, *input_lines]
 
     with output_file.open("w") as f:
-        f.write(f"# yaml-language-server: $schema={schema_file}\n")
+        f.writelines(output_lines)
+
     return True
 
 
-def get_schema(some_callable_or_type: type | Callable):
-    if inspect.isclass(some_callable_or_type):
-        object_type = some_callable_or_type
-    else:
-        assert callable(some_callable_or_type)
-        # IDEA: Use hydra_zen to create a dataclass that parametrizes this callable.
-        object_type = hydra_zen.builds(some_callable_or_type, populate_full_signature=True)
+def get_schema(config: DictConfig):
+    logger.debug(f"Config: {config}")
+    # todo: maybe support the case where there's a single entry in the dictionary, which itself has a _target_ key
+    if len(config) == 1 and "_target_" in (only_value := next(iter(config.values()))):
+        logger.debug(f"Only value: {only_value}")
+        raise NotImplementedError("TODO?")
+        # config = config[list(config.keys())[0]]
 
-    json_schema = pydantic.TypeAdapter(object_type).json_schema(mode="serialization")
+    target = hydra_zen.get_target(config)
+
+    if dataclasses.is_dataclass(target):
+        # The target is a dataclass, so the schema is just the schema of the dataclass.
+        object_type = target
+    else:
+        # The target is a type or callable.
+        assert callable(target)
+        object_type = hydra_zen.builds(
+            target,
+            populate_full_signature=True,
+            hydra_recursive=True,
+            hydra_convert="all",
+        )
+
+    json_schema = pydantic.TypeAdapter(object_type).json_schema(
+        mode="serialization", schema_generator=MyGenerateJsonSchema
+    )
     # Add field docstrings as descriptions in the schema!
     json_schema = _update_schema_with_descriptions(object_type, json_schema=json_schema)
     return json_schema
+
+
+class MyGenerateJsonSchema(GenerateJsonSchema):
+    # def handle_invalid_for_json_schema(
+    #     self, schema: core_schema.CoreSchema, error_info: str
+    # ) -> JsonSchemaValue:
+    #     raise PydanticOmit
+
+    def enum_schema(self, schema: core_schema.EnumSchema) -> JsonSchemaValue:
+        """Generates a JSON schema that matches an Enum value.
+
+        Args:
+            schema: The core schema.
+
+        Returns:
+            The generated JSON schema.
+        """
+        enum_type = schema["cls"]
+        logger.debug(f"Enum of type {enum_type}")
+        import torchvision.models.resnet
+
+        if issubclass(enum_type, torchvision.models.WeightsEnum):
+
+            @dataclasses.dataclass
+            class Dummy:
+                value: str
+
+            slightly_changed_schema = schema | {
+                "members": [Dummy(v.name) for v in schema["members"]]
+            }
+            return super().enum_schema(slightly_changed_schema)
+        return super().enum_schema(schema)
 
 
 def save_yaml_with_schema_in_vscode_settings(
@@ -241,3 +332,29 @@ def _update_definition_in_schema_using_dc(definition: dict[str, Any], dc_type: t
         field_desc = field_docstring.help_string.strip()
         if field_desc:
             property_values.setdefault("description", field_desc)
+
+
+if __name__ == "__main__":
+    import logging
+
+    import rich.logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        # format="%(asctime)s - %(levelname)s - %(message)s",
+        format="%(message)s",
+        datefmt="[%X]",
+        force=True,
+        handlers=[
+            rich.logging.RichHandler(
+                markup=True,
+                rich_tracebacks=True,
+                tracebacks_width=100,
+                tracebacks_show_locals=False,
+            )
+        ],
+    )
+
+    root_logger = logging.getLogger("project")
+
+    add_or_update_shemas_for_yaml_configs()
