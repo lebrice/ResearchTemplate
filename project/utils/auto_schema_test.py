@@ -1,3 +1,6 @@
+from pathlib import Path
+
+
 class Foo:
     def __init__(self, some_integer: int, optional_str: str = "bob"):
         self.some_integer = some_integer
@@ -22,7 +25,7 @@ expected_schema = {
     },
 }
 
-initial_yaml_contet = """\
+initial_yaml_content = """\
 __target__: project.utils.auto_schema_test.Foo
 some_integer: 42
 """
@@ -34,8 +37,19 @@ some_integer: 42
 """
 
 
-def test_get_schema():
-    from project.utils.auto_schema import get_schema
+def test_get_schema(tmp_path: Path):
+    from project.utils._auto_schema import add_schema_to_hydra_config_file
 
-    schema = get_schema(Foo)
-    assert schema == expected_schema
+    input_file = tmp_path / "input.yaml"
+    input_file.write_text(initial_yaml_content)
+
+    schema_file = tmp_path / ".input_schema.yaml"
+
+    output_file = tmp_path / "output.yaml"
+    success = add_schema_to_hydra_config_file(
+        input_file=input_file, output_file=output_file, schema_file=schema_file
+    )
+    assert success
+
+    assert output_file.read_text() == expected_yaml_content
+    # assert schema_file.read_text() == json.dumps(expected_schema, indent=2) + "\n"
