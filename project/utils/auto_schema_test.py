@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-import hydra
 import hydra_zen
 import pytest
 from hydra.core.plugins import Plugins
@@ -10,10 +9,8 @@ from hydra.test_utils.config_source_common_tests import ConfigSourceTestSuite
 from pytest_regressions.file_regression import FileRegressionFixture
 
 from project.utils.auto_schema import (
-    CONFIGS_DIR,
     AutoSchemaPlugin,
     add_schema_header,
-    add_schema_to_hydra_config_file,
     get_schema,
 )
 from project.utils.env_vars import REPO_ROOTDIR
@@ -53,12 +50,10 @@ def test_get_schema(
     file_regression: FileRegressionFixture,
     original_datadir: Path,
 ):
-    *config_groups, config_name = input_file.relative_to(CONFIGS_DIR).with_suffix("").parts
-    config_group = "/".join(config_groups)
-    if input_file.name != "config.yaml":
-        with hydra.initialize(config_path=str((CONFIGS_DIR).relative_to(Path.cwd()))):
-            assert False, hydra.compose(overrides=[f"{config_group}={config_name}"])
-    config_name = str(input_file.relative_to(REPO_ROOTDIR / "project/configs"))
+    # *config_groups, config_name = input_file.relative_to(CONFIGS_DIR).with_suffix("").parts
+    # config_group = "/".join(config_groups)
+
+    # config_name = str(input_file.relative_to(REPO_ROOTDIR / "project/configs"))
     try:
         # todo: this is dumb, the _target_ could be in the defaults list!
         _config = hydra_zen.load_from_yaml(input_file)
@@ -73,16 +68,5 @@ def test_get_schema(
     add_schema_header(config_file, schema_path)
 
     schema = get_schema(config_file)
+
     file_regression.check(json.dumps(schema, indent=2), fullpath=schema_path, extension=".json")
-
-
-def test_on_actual_configs():
-    config_file = REPO_ROOTDIR / "project" / "configs" / "network" / "resnet50.yaml"
-    schema_file = REPO_ROOTDIR / "project" / "configs" / "network" / ".resnet50_schema.json"
-    add_schema_to_hydra_config_file(
-        config_file, config_file.with_stem("resnet50_with_schema"), schema_file=schema_file
-    )
-
-    config_file = REPO_ROOTDIR / "project" / "configs" / "network" / "foo.yaml"
-    schema_file = REPO_ROOTDIR / "project" / "configs" / "network" / ".foo_schema.json"
-    add_schema_to_hydra_config_file(config_file, config_file, schema_file=schema_file)

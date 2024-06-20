@@ -188,6 +188,9 @@ class Schema(TypedDict):
     properties: dict[str, PropertySchema]
 
 
+# TODO: read this:
+# https://suneeta-mall.github.io/2022/03/15/hydra-pydantic-config-management-for-training-application.html#hydra-directives
+# https://wandb.ai/adrishd/hydra-example/reports/Configuring-W-B-Projects-with-Hydra--VmlldzoxNTA2MzQw
 def adapt_schema_for_hydra(
     input_file: Path, config: DictConfig, schema_from_pydantic: dict[str, Any]
 ):
@@ -200,9 +203,20 @@ def adapt_schema_for_hydra(
     """
     # TODO: This generated schema does not seem that well-adapted for Hydra, actually.
     schema = copy.deepcopy(schema_from_pydantic)
+
+    def target_has_var_kwargs(config: DictConfig) -> bool:
+        target = hydra_zen.get_target(config)  # type: ignore
+        return inspect.getfullargspec(target).varkw is None
+
     if hydra_zen.is_partial_builds(config):
         # todo: add a special marker that allows extra fields?
         schema["required"] = []
+
+    if target_has_var_kwargs(config):
+        # if the target takes **kwargs, then we don't restrict additional properties.
+        schema["additionalProperties"] = True
+    else:
+        schema["additionalProperties"] = False
     return schema
 
 
