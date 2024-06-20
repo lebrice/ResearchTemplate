@@ -1,7 +1,36 @@
+import json
 from pathlib import Path
 
-from project.configs.datamodule import REPO_ROOTDIR
-from project.utils.auto_schema import add_schema_to_hydra_config_file
+import hydra
+import hydra_zen
+import pytest
+from hydra.core.plugins import Plugins
+from hydra.plugins.config_source import ConfigSource
+from hydra.test_utils.config_source_common_tests import ConfigSourceTestSuite
+from pytest_regressions.file_regression import FileRegressionFixture
+
+from project.utils.auto_schema import (
+    CONFIGS_DIR,
+    AutoSchemaPlugin,
+    add_schema_header,
+    add_schema_to_hydra_config_file,
+    get_schema,
+)
+from project.utils.env_vars import REPO_ROOTDIR
+
+
+@pytest.mark.xfail(raises=(NotImplementedError, ValueError), reason="Not implemented yet.")
+@pytest.mark.parametrize(
+    ("type_", "path"), [(AutoSchemaPlugin, "project://project.utils.auto_schema")]
+)
+class TestAutoSchemaPlugin(ConfigSourceTestSuite): ...
+
+
+def test_discovery() -> None:
+    # Test that this config source is discoverable when looking at config sources
+    assert AutoSchemaPlugin.__name__ in [
+        x.__name__ for x in Plugins.instance().discover(ConfigSource)
+    ]
 
 
 # @dataclass
@@ -13,50 +42,38 @@ class Foo:
         self.optional_str = optional_str
 
 
-expected_schema = {
-    "title": "Foo",
-    "type": "object",
-    "description": "Some docstring.",
-    "properties": {
-        "some_integer": {
-            "title": "some_integer",
-            "type": "integer",
-            #   "description": "A very important field."
-        },
-        "optional_str": {
-            "title": "optional_str",
-            "type": "string",
-            "default": "bob",
-        },
-    },
-}
+@pytest.mark.parametrize(
+    "input_file",
+    [file for file in (REPO_ROOTDIR / "project/configs").rglob("*.yaml")],
+    ids=lambda x: str(x.relative_to(REPO_ROOTDIR / "project/configs")),
+)
+def test_get_schema(
+    input_file: Path,
+    tmp_path: Path,
+    file_regression: FileRegressionFixture,
+    original_datadir: Path,
+):
+    *config_groups, config_name = input_file.relative_to(CONFIGS_DIR).with_suffix("").parts
+    config_group = "/".join(config_groups)
+    if input_file.name != "config.yaml":
+        with hydra.initialize(config_path=str((CONFIGS_DIR).relative_to(Path.cwd()))):
+            assert False, hydra.compose(overrides=[f"{config_group}={config_name}"])
+    config_name = str(input_file.relative_to(REPO_ROOTDIR / "project/configs"))
+    try:
+        # todo: this is dumb, the _target_ could be in the defaults list!
+        _config = hydra_zen.load_from_yaml(input_file)
+        _target = hydra_zen.get_target(_config)  # type: ignore
+    except TypeError:
+        pytest.skip(reason=f"Config at {input_file} doesn't have a target.")
 
-initial_yaml_content = """\
-_target_: project.utils.auto_schema_test.Foo
-some_integer: 42
-"""
+    config_file = original_datadir / input_file.name
+    config_file.write_text(input_file.read_text())
 
-expected_yaml_content = """\
-# yaml-language-server: $schema=SCHEMA_PATH
-_target_: project.utils.auto_schema_test.Foo
-some_integer: 42
-"""
+    schema_path = (original_datadir / input_file.name).with_suffix(".json")
+    add_schema_header(config_file, schema_path)
 
-
-def test_get_schema(tmp_path: Path):
-    input_file = tmp_path / "input.yaml"
-    input_file.write_text(initial_yaml_content)
-
-    schema_file = tmp_path / ".input_schema.yaml"
-
-    output_file = tmp_path / "output.yaml"
-    success = add_schema_to_hydra_config_file(
-        input_file=input_file, output_file=output_file, schema_file=schema_file
-    )
-    assert success
-    assert output_file.read_text() == expected_yaml_content.replace(
-        "SCHEMA_PATH", schema_file.as_posix()
-    )
+    schema = get_schema(config_file)
+    file_regression.check(json.dumps(schema, indent=2), fullpath=schema_path, extension=".json")
 
 
 def test_on_actual_configs():

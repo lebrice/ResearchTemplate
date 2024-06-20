@@ -3,13 +3,20 @@ import dataclasses
 import inspect
 import itertools
 import json
+import os.path
 from logging import getLogger as get_logger
 from pathlib import Path
-from typing import Any, TypeGuard, TypeVar
+from typing import Any, TypedDict, TypeGuard, TypeVar
 
+import flax
+import flax.linen
+import flax.struct
 import hydra_zen
 import pydantic
 import pydantic.schema
+from hydra.core.object_type import ObjectType
+from hydra.core.plugins import Plugins
+from hydra.plugins.config_source import ConfigResult, ConfigSource
 from omegaconf import DictConfig
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from pydantic_core import core_schema
@@ -17,9 +24,50 @@ from simple_parsing.docstring import get_attribute_docstring, inspect_getdoc
 from simple_parsing.helpers.serialization.serializable import dump_yaml
 from simple_parsing.utils import Dataclass, PossiblyNestedDict, is_dataclass_type
 
-from project.configs.datamodule import REPO_ROOTDIR
+from project.utils.env_vars import REPO_ROOTDIR
 
 logger = get_logger(__name__)
+
+
+class AutoSchemaPlugin(ConfigSource):
+    # todo: Perhaps we can make a hydra plugin with the auto-schema stuff?
+    def __init__(self, provider: str, path: str) -> None:
+        super().__init__(provider=provider, path=path)
+        logger.info(f"{provider=}, {path=}")
+
+    @staticmethod
+    def scheme() -> str:
+        return "auto_schema"
+
+    def load_config(self, config_path: str) -> ConfigResult:
+        _name = self._normalize_file_name(config_path)
+        raise NotImplementedError(config_path)
+
+    def is_group(self, config_path: str) -> bool:
+        raise NotImplementedError(config_path)
+
+    def is_config(self, config_path: str) -> bool:
+        raise NotImplementedError(config_path)
+
+    def available(self) -> bool:
+        """
+        :return: True is this config source is pointing to a valid location
+        """
+        return True
+        raise NotImplementedError()
+
+    def list(self, config_path: str, results_filter: ObjectType | None) -> list[str]:
+        """List items under the specified config path.
+
+        :param config_path: config path to list items in, examples: "", "foo", "foo/bar"
+        :param results_filter: None for all, GROUP for groups only and CONFIG for configs only
+        :return: a list of config or group identifiers (sorted and unique)
+        """
+        raise NotImplementedError(config_path, results_filter)
+
+
+# def register_auto_schema_plugin() -> None:
+Plugins.instance().register(AutoSchemaPlugin)
 
 
 def add_or_update_shemas_for_yaml_configs(
@@ -43,26 +91,9 @@ def add_or_update_shemas_for_yaml_configs(
             logger.info(f"Updated schema for {config_file}.")
 
 
-def add_schema_to_hydra_config_file(
-    input_file: Path, output_file: Path, schema_file: Path
-) -> bool:
-    config = hydra_zen.load_from_yaml(input_file)
-    assert isinstance(config, DictConfig)
-    schema = get_schema(config)
-    schema_file.write_text(json.dumps(schema, indent=2) + "\n")
-    input_lines = input_file.read_text().splitlines(keepends=True)
-
-    # todo: remove this hard-coded assumption, use relative paths instead.
-    configs_dir = REPO_ROOTDIR / "project" / "configs"
-    assert input_file.is_relative_to(configs_dir)
-    assert output_file.is_relative_to(configs_dir)
-    assert schema_file.is_relative_to(configs_dir)
-    n_parents = len(input_file.relative_to(configs_dir).parts) - 1
-    relative_path_to_schema = Path(
-        "/".join(n_parents * [".."]) + "/" + str(schema_file.relative_to(configs_dir))
-    )
-    # relative_path_to_schema = schema_file.relative_to(REPO_ROOTDIR)
-
+def add_schema_header(config_file: Path, schema_path: Path) -> None:
+    input_lines = config_file.read_text().splitlines(keepends=True)
+    relative_path_to_schema = os.path.relpath(schema_path, start=config_file.parent)
     new_first_line = f"# yaml-language-server: $schema={relative_path_to_schema}\n"
     # todo; remove leading empty lines.
     if input_lines[0].startswith("# yaml-language-server: $schema="):
@@ -70,23 +101,51 @@ def add_schema_to_hydra_config_file(
     else:
         output_lines = [new_first_line, *input_lines]
 
-    with output_file.open("w") as f:
+    with config_file.open("w") as f:
         f.writelines(output_lines)
 
+
+def add_schema_to_hydra_config_file(
+    input_file: Path, output_file: Path, schema_file: Path
+) -> bool:
+    schema = get_schema(input_file)
+    schema_file.write_text(json.dumps(schema, indent=2) + "\n")
+    add_schema_header(input_file, schema_path=schema_file)
     return True
 
 
-def get_schema(config: DictConfig):
+CONFIGS_DIR = REPO_ROOTDIR / "project/configs"
+
+
+# todo: read https://stackoverflow.com/questions/70639556/is-it-possible-to-use-pydantic-instead-of-dataclasses-in-structured-configs-in-h
+def get_schema(input_file: Path):
+    # todo: instead of using `load_from_yaml`, we should use something like `get_config_loader()`
+
+    # *config_groups, config_name = input_file.relative_to(CONFIGS_DIR).with_suffix("").parts
+    # config_group = "/".join(config_groups)
+    # config = get_config_loader().load_configuration(None, overrides=[f"{config_group}={config_name}"])
+
+    config = hydra_zen.load_from_yaml(input_file)
+    assert isinstance(config, DictConfig)
     logger.debug(f"Config: {config}")
     # todo: maybe support the case where there's a single entry in the dictionary, which itself has a _target_ key
     if len(config) == 1 and "_target_" in (only_value := next(iter(config.values()))):
         logger.debug(f"Only value: {only_value}")
         raise NotImplementedError("TODO?")
-        # config = config[list(config.keys())[0]]
 
-    target = hydra_zen.get_target(config)
+    # todo: this doesn't take `defaults` into account.
+    target = hydra_zen.get_target(config)  # type: ignore
 
-    if dataclasses.is_dataclass(target):
+    if inspect.isclass(target) and issubclass(target, flax.linen.Module):
+        object_type = hydra_zen.builds(
+            target,
+            populate_full_signature=True,
+            hydra_recursive=False,
+            hydra_convert="all",
+            zen_exclude=["parent"],
+            dataclass_name=f"{target.__name__}Config",
+        )
+    elif dataclasses.is_dataclass(target):
         # The target is a dataclass, so the schema is just the schema of the dataclass.
         object_type = target
     else:
@@ -95,16 +154,56 @@ def get_schema(config: DictConfig):
         object_type = hydra_zen.builds(
             target,
             populate_full_signature=True,
-            hydra_recursive=True,
+            hydra_defaults=config.get("defaults", None),
+            hydra_recursive=False,
             hydra_convert="all",
+            dataclass_name=f"{target.__name__}Config",
+            # zen_wrappers=pydantic_parser,  # unsure if this is how it works?
         )
 
     json_schema = pydantic.TypeAdapter(object_type).json_schema(
         mode="serialization", schema_generator=MyGenerateJsonSchema
     )
+
     # Add field docstrings as descriptions in the schema!
     json_schema = _update_schema_with_descriptions(object_type, json_schema=json_schema)
-    return json_schema
+
+    schema = adapt_schema_for_hydra(input_file, config, json_schema)
+
+    return schema
+
+
+class PropertySchema(TypedDict, total=False):
+    title: str
+    type: str
+    description: str
+    default: Any
+    examples: list[str]
+    deprecated: bool
+    readOnly: bool
+    writeOnly: bool
+
+
+class Schema(TypedDict):
+    properties: dict[str, PropertySchema]
+
+
+def adapt_schema_for_hydra(
+    input_file: Path, config: DictConfig, schema_from_pydantic: dict[str, Any]
+):
+    """TODO: Adapt the schema to be better adapted for Hydra configs.
+
+    TODOs:
+    - [ ] defaults should always be accepted as a field.
+    - [ ] _partial_ should make it so there are no mandatory fields
+    - [ ] Unexpected extra fields should not be allowed
+    """
+    # TODO: This generated schema does not seem that well-adapted for Hydra, actually.
+    schema = copy.deepcopy(schema_from_pydantic)
+    if hydra_zen.is_partial_builds(config):
+        # todo: add a special marker that allows extra fields?
+        schema["required"] = []
+    return schema
 
 
 class MyGenerateJsonSchema(GenerateJsonSchema):
@@ -113,7 +212,7 @@ class MyGenerateJsonSchema(GenerateJsonSchema):
     # ) -> JsonSchemaValue:
     #     raise PydanticOmit
 
-    def enum_schema(self, schema: core_schema.EnumSchema) -> JsonSchemaValue:
+    def enum_schema(self, schema: "core_schema.EnumSchema") -> JsonSchemaValue:
         """Generates a JSON schema that matches an Enum value.
 
         Args:
