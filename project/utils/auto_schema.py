@@ -3,10 +3,12 @@ import dataclasses
 import inspect
 import itertools
 import json
+import logging
 import os.path
+from collections.abc import Callable
 from logging import getLogger as get_logger
 from pathlib import Path
-from typing import Any, TypedDict, TypeGuard, TypeVar
+from typing import Any, NotRequired, TypedDict, TypeGuard, TypeVar
 
 import flax
 import flax.linen
@@ -17,7 +19,8 @@ import pydantic.schema
 from hydra.core.object_type import ObjectType
 from hydra.core.plugins import Plugins
 from hydra.plugins.config_source import ConfigResult, ConfigSource
-from omegaconf import DictConfig
+from hydra.types import RunMode
+from omegaconf import DictConfig, OmegaConf
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from pydantic_core import core_schema
 from simple_parsing.docstring import get_attribute_docstring, inspect_getdoc
@@ -25,8 +28,153 @@ from simple_parsing.helpers.serialization.serializable import dump_yaml
 from simple_parsing.utils import Dataclass, PossiblyNestedDict, is_dataclass_type
 
 from project.utils.env_vars import REPO_ROOTDIR
+from project.utils.testutils import get_config_loader
+from project.utils.types import NestedMapping, is_sequence_of
 
+logging.getLogger("simple_parsing.docstring").setLevel(logging.ERROR)
 logger = get_logger(__name__)
+
+
+class PropertySchema(TypedDict, total=False):
+    title: str
+    type: str
+    description: str
+    default: Any
+    examples: list[str]
+    deprecated: bool
+    readOnly: bool
+    writeOnly: bool
+
+
+class Schema(TypedDict):
+    # "$defs":
+    properties: dict[str, PropertySchema]
+    additionalProperties: NotRequired[bool]
+
+
+def create_schema_for_config(config_file: Path) -> Schema:
+    """IDEA: Create a schema for the given config.
+
+    - If you encounter a key, add it to the schema.
+    - If you encounter a value with a _target_, use a dedicated function to get the schema for that target, and merge it into the current schema.
+    - Only the top-level config (`config`) can have a `defaults: list[str]` key.
+        - Should ideally load the defaults and merge this schema on top of them.
+    """
+
+    config = load_config(config_file)
+    schema = Schema(properties={})
+
+    # note: the `defaults` list gets consumed by Hydra in `load_config`, so we actually re-read the
+    # config file to get the `defaults`, if present.
+    _config = OmegaConf.to_container(OmegaConf.load(config_file), resolve=False)
+    assert isinstance(_config, dict)
+    defaults = _config.get("defaults")
+    if defaults:
+        defaults_list = defaults
+        assert is_sequence_of(defaults_list, str), defaults_list
+        for default in defaults_list:
+            assert not default.startswith("/")
+            other_config_path = (config_file.parent / default).with_suffix(".yaml")
+            # todo: can also point to a structured config node!
+            assert other_config_path.exists()
+            default_schema = create_schema_for_config(other_config_path)
+            logger.debug(f"Schema from default {default}: {default_schema}")
+            logger.debug(f"Properties of {default=}: {list(default_schema["properties"].keys())}")
+            schema = merge_dicts(
+                default_schema,
+                schema,
+                conflict_handlers={"title": keep_previous, "description": keep_previous},
+            )
+            # todo: deal with this one here.
+            if schema.get("additionalProperties") is False:
+                schema.pop("additionalProperties")
+
+    if "_target_" in config:
+        target = config["_target_"]
+        schema_from_target = get_schema_from_target(config_file)
+        logger.debug(f"Schema from target {target}: {schema_from_target}")
+        logger.debug(f"Schema from target {target}: {schema_from_target}")
+        schema = merge_dicts(
+            schema,
+            schema_from_target,
+            conflict_handlers={"title": keep_previous, "description": keep_previous},
+        )
+
+    for key, value in config.items():
+        assert isinstance(key, str)
+        if key in ["_target_", "defaults"]:
+            continue
+        if key not in schema["properties"]:
+            schema["properties"][key] = {"default": value}
+        else:
+            ...
+
+    return schema
+
+
+def overwrite(val_a: Any, val_b: Any) -> Any:
+    return val_b
+
+
+def keep_previous(val_a: Any, val_b: Any) -> Any:
+    return val_a
+
+
+conflict_handlers: dict[str, Callable[[Any, Any], Any]] = {
+    "_target_": overwrite,  # use the new target.
+    "default": overwrite,  # use the new default?
+}
+
+
+def merge_dicts[D1: NestedMapping, D2: NestedMapping](
+    a: D1,
+    b: D2,
+    path: list[str] = [],
+    conflict_handlers: dict[str, Callable[[Any, Any], Any]] = conflict_handlers,
+) -> D1 | D2:
+    """Merge two nested dictionaries.
+
+    >>> x = dict(b=1, c=dict(d=2, e=3))
+    >>> y = dict(d=3, c=dict(z=2, f=4))
+    >>> merge_dicts(x, y)
+    {'b': 1, 'c': {'d': 2, 'e': 3, 'z': 2, 'f': 4}, 'd': 3}
+    >>> x
+    {'b': 1, 'c': {'d': 2, 'e': 3}}
+    >>> y
+    {'d': 3, 'c': {'z': 2, 'f': 4}}
+    """
+    out = copy.deepcopy(a)
+    for key in b:
+        if key in a:
+            if isinstance(a[key], dict) and isinstance(b[key], dict):
+                out[key] = merge_dicts(a[key], b[key], path + [str(key)])
+            elif a[key] != b[key]:
+                if conflict_handler := conflict_handlers.get(key):
+                    out[key] = conflict_handler(a[key], b[key])
+                else:
+                    raise Exception("Conflict at " + ".".join(path + [str(key)]))
+        else:
+            out[key] = copy.deepcopy(b[key])
+    return out
+
+
+def load_config(config_path: Path) -> DictConfig:
+    *config_groups, config_name = config_path.relative_to(CONFIGS_DIR).with_suffix("").parts
+    logger.debug(f"{config_path=}, {config_groups=}, {config_name=}")
+    config_group = "/".join(config_groups)
+    top_config = get_config_loader().load_configuration(
+        f"{config_group}/{config_name}", overrides=[], run_mode=RunMode.RUN
+    )
+    config = top_config
+    for config_group in config_groups:
+        config = config[config_group]
+    return config
+
+
+def create_schema(node: dict) -> dict: ...
+
+
+def create_schema_for_value(value: Any): ...
 
 
 class AutoSchemaPlugin(ConfigSource):
@@ -94,6 +242,8 @@ def add_or_update_shemas_for_yaml_configs(
 def add_schema_header(config_file: Path, schema_path: Path) -> None:
     input_lines = config_file.read_text().splitlines(keepends=True)
     relative_path_to_schema = os.path.relpath(schema_path, start=config_file.parent)
+    if config_file.parent is schema_path.parent:
+        relative_path_to_schema = "./" + schema_path.name
     new_first_line = f"# yaml-language-server: $schema={relative_path_to_schema}\n"
     # todo; remove leading empty lines.
     if input_lines[0].startswith("# yaml-language-server: $schema="):
@@ -108,7 +258,7 @@ def add_schema_header(config_file: Path, schema_path: Path) -> None:
 def add_schema_to_hydra_config_file(
     input_file: Path, output_file: Path, schema_file: Path
 ) -> bool:
-    schema = get_schema(input_file)
+    schema = get_schema_from_target(input_file)
     schema_file.write_text(json.dumps(schema, indent=2) + "\n")
     add_schema_header(input_file, schema_path=schema_file)
     return True
@@ -118,7 +268,7 @@ CONFIGS_DIR = REPO_ROOTDIR / "project/configs"
 
 
 # todo: read https://stackoverflow.com/questions/70639556/is-it-possible-to-use-pydantic-instead-of-dataclasses-in-structured-configs-in-h
-def get_schema(input_file: Path):
+def get_schema_from_target(input_file: Path) -> Schema:
     # todo: instead of using `load_from_yaml`, we should use something like `get_config_loader()`
 
     # *config_groups, config_name = input_file.relative_to(CONFIGS_DIR).with_suffix("").parts
@@ -171,21 +321,6 @@ def get_schema(input_file: Path):
     schema = adapt_schema_for_hydra(input_file, config, json_schema)
 
     return schema
-
-
-class PropertySchema(TypedDict, total=False):
-    title: str
-    type: str
-    description: str
-    default: Any
-    examples: list[str]
-    deprecated: bool
-    readOnly: bool
-    writeOnly: bool
-
-
-class Schema(TypedDict):
-    properties: dict[str, PropertySchema]
 
 
 # TODO: read this:

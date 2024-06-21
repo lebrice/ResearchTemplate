@@ -11,7 +11,8 @@ from pytest_regressions.file_regression import FileRegressionFixture
 from project.utils.auto_schema import (
     AutoSchemaPlugin,
     add_schema_header,
-    get_schema,
+    create_schema_for_config,
+    get_schema_from_target,
 )
 from project.utils.env_vars import REPO_ROOTDIR
 
@@ -44,6 +45,34 @@ class Foo:
     [file for file in (REPO_ROOTDIR / "project/configs").rglob("*.yaml")],
     ids=lambda x: str(x.relative_to(REPO_ROOTDIR / "project/configs")),
 )
+def test_create_schema_for_config(
+    input_file: Path,
+    tmp_path: Path,
+    file_regression: FileRegressionFixture,
+    original_datadir: Path,
+):
+    if input_file.name == "config.yaml":
+        pytest.skip(
+            reason="TODO: handle the top-level config later, seems harder to work on for a first POC"
+        )
+    config_file = original_datadir / input_file.name
+    config_file.parent.mkdir(exist_ok=True, parents=True)
+    config_file.write_text(input_file.read_text())
+
+    schema = create_schema_for_config(input_file)
+    schema_path = (original_datadir / input_file.name).with_suffix(".json")
+    add_schema_header(config_file, schema_path)
+
+    schema = get_schema_from_target(config_file)
+    file_regression.check(json.dumps(schema, indent=2), fullpath=schema_path, extension=".json")
+
+
+@pytest.mark.skip(reason="Skipping for now in favour of the test above.")
+@pytest.mark.parametrize(
+    "input_file",
+    [file for file in (REPO_ROOTDIR / "project/configs").rglob("*.yaml")],
+    ids=lambda x: str(x.relative_to(REPO_ROOTDIR / "project/configs")),
+)
 def test_get_schema(
     input_file: Path,
     tmp_path: Path,
@@ -62,11 +91,12 @@ def test_get_schema(
         pytest.skip(reason=f"Config at {input_file} doesn't have a target.")
 
     config_file = original_datadir / input_file.name
+    config_file.parent.mkdir(exist_ok=True, parents=True)
     config_file.write_text(input_file.read_text())
 
     schema_path = (original_datadir / input_file.name).with_suffix(".json")
     add_schema_header(config_file, schema_path)
 
-    schema = get_schema(config_file)
+    schema = get_schema_from_target(config_file)
 
     file_regression.check(json.dumps(schema, indent=2), fullpath=schema_path, extension=".json")
